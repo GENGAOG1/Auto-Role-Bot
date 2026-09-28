@@ -1,194 +1,593 @@
-# app.py
-# Flask web dashboard + Discord nuke bot for Render.
-# Requires: pip install flask discord.py
-# Render: set TOKEN and DASH_KEY as environment variables, start: python app.py
-
 import os
 import threading
 import asyncio
+import logging
+
 import discord
 from discord.ext import commands
 from flask import Flask, request, redirect, url_for, session
 
-TOKEN = os.environ.get("TOKEN", "YOUR_BOT_TOKEN_HERE")
-DASH_KEY = os.environ.get("DASH_KEY", "changeme")
+# ============================================================
+# CONFIG
+# ============================================================
+
+TOKEN = os.environ.get("TOKEN")
+DASH_KEY = os.environ.get("DASH_KEY")
+SECRET_KEY = os.environ.get("SECRET_KEY")
+
 PREFIX = "!"
 
-SPAM_MESSAGE = "@everyone SERVER NUKED"
-SPAM_COUNT = 20
-CHANNEL_COUNT = 40
+# ============================================================
+# LOGGING
+# ============================================================
 
-intents = discord.Intents.all()
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s"
+)
+
+log = logging.getLogger("genga-bot")
+
+# ============================================================
+# VALIDATE ENVIRONMENT
+# ============================================================
+
+if not TOKEN:
+    raise RuntimeError(
+        "TOKEN environment variable is missing. "
+        "Add TOKEN in Render Environment Variables."
+    )
+
+if not DASH_KEY:
+    raise RuntimeError(
+        "DASH_KEY environment variable is missing."
+    )
+
+if not SECRET_KEY:
+    raise RuntimeError(
+        "SECRET_KEY environment variable is missing."
+    )
+
+# ============================================================
+# DISCORD
+# ============================================================
+
+intents = discord.Intents.default()
+
+# Required for commands that read message content
+intents.message_content = True
+
+# Required for member counts/member information
+intents.members = True
+
+bot = commands.Bot(
+    command_prefix=PREFIX,
+    intents=intents
+)
+
+# ============================================================
+# FLASK
+# ============================================================
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "flasksecret")
+app.secret_key = SECRET_KEY
 
-# ---------------- BOT LOGIC ----------------
 
-async def nuke_guild(guild):
-    # Delete all channels
-    for channel in list(guild.channels):
-        try:
-            await channel.delete()
-        except Exception:
-            pass
+# ============================================================
+# DISCORD EVENTS
+# ============================================================
 
-    # Delete all roles except @everyone and managed
-    for role in list(guild.roles):
-        if role.name != "@everyone" and not role.managed:
-            try:
-                await role.delete()
-            except Exception:
-                pass
+@bot.event
+async def on_ready():
+    log.info("========================================")
+    log.info("DISCORD BOT ONLINE")
+    log.info("User: %s", bot.user)
+    log.info("ID: %s", bot.user.id)
+    log.info("Servers: %s", len(bot.guilds))
 
-    # Ban all members except bot and owner
-    for member in list(guild.members):
-        if member != guild.me and member != guild.owner:
-            try:
-                await member.ban(reason="nuke")
-            except Exception:
-                pass
+    for guild in bot.guilds:
+        log.info(
+            "Guild: %s | ID: %s | Members: %s",
+            guild.name,
+            guild.id,
+            guild.member_count
+        )
 
-    # Create 40 channels and spam each
-    for i in range(CHANNEL_COUNT):
-        try:
-            ch = await guild.create_text_channel(f"nuked-{i}")
-            for _ in range(SPAM_COUNT):
-                try:
-                    await ch.send(SPAM_MESSAGE)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    log.info("========================================")
 
-def run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        bot.run(TOKEN)
-    except Exception as e:
-        print(f"BOT ERROR: {e}", flush=True)
 
-def keep_alive():
-    import urllib.request
-    import time
-    url = os.environ.get("RENDER_EXTERNAL_URL")
-    if not url:
+@bot.event
+async def on_disconnect():
+    log.warning("Discord connection lost.")
+
+
+@bot.event
+async def on_resumed():
+    log.info("Discord connection resumed.")
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
         return
-    while True:
-        time.sleep(600)
-        try:
-            urllib.request.urlopen(url)
-        except Exception:
-            pass
 
-# ---------------- AUTH ----------------
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send(
+            "❌ You don't have permission to use this command.",
+            delete_after=5
+        )
+        return
+
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(
+            "❌ Missing required argument.",
+            delete_after=5
+        )
+        return
+
+    log.exception("Command error:", exc_info=error)
+
+    try:
+        await ctx.send(
+            "❌ An error occurred while executing the command.",
+            delete_after=5
+        )
+    except Exception:
+        pass
+
+
+# ============================================================
+# SAFE TEST COMMANDS
+# ============================================================
+
+@bot.command(name="ping")
+async def ping(ctx):
+    latency = round(bot.latency * 1000)
+
+    await ctx.send(
+        f"🏓 Pong! `{latency} ms`"
+    )
+
+
+@bot.command(name="Start")
+@commands.has_permissions(administrator=True)
+async def start(ctx):
+    """
+    Safe replacement for the old destructive !Start command.
+    It only confirms that the bot is operational.
+    """
+
+    await ctx.send(
+        "✅ Bot is online and responding correctly."
+    )
+
+
+@bot.command(name="server")
+@commands.has_permissions(administrator=True)
+async def server_info(ctx):
+    guild = ctx.guild
+
+    if guild is None:
+        await ctx.send("❌ This command must be used inside a server.")
+        return
+
+    await ctx.send(
+        f"**Server Information**\n"
+        f"Name: `{guild.name}`\n"
+        f"ID: `{guild.id}`\n"
+        f"Members: `{guild.member_count}`\n"
+        f"Channels: `{len(guild.channels)}`\n"
+        f"Roles: `{len(guild.roles)}`"
+    )
+
+
+# ============================================================
+# AUTH
+# ============================================================
 
 def logged_in():
     return session.get("auth") is True
 
+
+# ============================================================
+# LOGIN
+# ============================================================
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
+
     if request.method == "POST":
-        if request.form.get("key") == DASH_KEY:
+
+        key = request.form.get("key", "")
+
+        if key == DASH_KEY:
             session["auth"] = True
             return redirect(url_for("index"))
-        return "Invalid key", 403
+
+        return """
+        <!DOCTYPE html>
+        <html>
+        <body style="
+            background:#111;
+            color:#eee;
+            font-family:monospace;
+            padding:30px;
+        ">
+            <h2>Invalid dashboard key</h2>
+            <a href="/login" style="color:#8ab4ff">
+                Try again
+            </a>
+        </body>
+        </html>
+        """, 403
+
     return """
-    <html><body style="background:#111;color:#eee;font-family:monospace">
-    <h2>Login</h2>
-    <form method="post">
-    <input name="key" type="password" placeholder="Dashboard Key" autofocus>
-    <button type="submit">Enter</button>
-    </form></body></html>
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Bot Login</title>
+    </head>
+
+    <body style="
+        background:#111;
+        color:#eee;
+        font-family:monospace;
+        padding:30px;
+    ">
+
+        <h2>Bot Dashboard</h2>
+
+        <form method="post">
+
+            <input
+                name="key"
+                type="password"
+                placeholder="Dashboard Key"
+                autofocus
+                style="
+                    padding:10px;
+                    background:#222;
+                    color:#fff;
+                    border:1px solid #555;
+                "
+            >
+
+            <button
+                type="submit"
+                style="
+                    padding:10px 18px;
+                    margin-left:5px;
+                    cursor:pointer;
+                "
+            >
+                Login
+            </button>
+
+        </form>
+
+    </body>
+    </html>
     """
+
+
+# ============================================================
+# LOGOUT
+# ============================================================
 
 @app.route("/logout")
 def logout():
+
     session.clear()
+
     return redirect(url_for("login"))
 
-# ---------------- DASHBOARD ----------------
+
+# ============================================================
+# DASHBOARD
+# ============================================================
 
 @app.route("/")
 def index():
+
     if not logged_in():
         return redirect(url_for("login"))
 
-    guilds = list(bot.guilds)
+    connected = bot.is_ready()
+
+    bot_name = str(bot.user) if bot.user else "Not connected"
+
     rows = ""
-    for g in guilds:
+
+    for guild in bot.guilds:
+
         rows += f"""
         <tr>
-            <td>{g.name}</td>
-            <td>{g.id}</td>
-            <td>{g.member_count}</td>
-            <td><a href="/server/{g.id}">Open</a></td>
+            <td>{guild.name}</td>
+            <td>{guild.id}</td>
+            <td>{guild.member_count}</td>
+            <td>
+                <a href="/server/{guild.id}">
+                    Open
+                </a>
+            </td>
         </tr>
         """
 
+    if not rows:
+        rows = """
+        <tr>
+            <td colspan="4">
+                Bot is not connected to any servers.
+            </td>
+        </tr>
+        """
+
+    status_color = "#35d07f" if connected else "#ff5555"
+
     return f"""
-    <html><body style="background:#111;color:#eee;font-family:monospace">
-    <h2>Bot Dashboard</h2>
-    <p>Logged in as {bot.user} | <a href="/logout">Logout</a></p>
-    <table border="1" cellpadding="8" style="border-collapse:collapse">
-    <tr><th>Server</th><th>ID</th><th>Members</th><th>Action</th></tr>
-    {rows}
-    </table>
-    </body></html>
+    <!DOCTYPE html>
+
+    <html>
+
+    <head>
+
+        <meta
+            name="viewport"
+            content="width=device-width,initial-scale=1"
+        >
+
+        <title>Bot Dashboard</title>
+
+        <style>
+
+            body {{
+                background:#111;
+                color:#eee;
+                font-family:monospace;
+                padding:20px;
+            }}
+
+            table {{
+                border-collapse:collapse;
+                width:100%;
+                max-width:900px;
+            }}
+
+            th, td {{
+                border:1px solid #444;
+                padding:10px;
+                text-align:left;
+            }}
+
+            th {{
+                background:#222;
+            }}
+
+            a {{
+                color:#8ab4ff;
+            }}
+
+            .status {{
+                color:{status_color};
+                font-weight:bold;
+            }}
+
+        </style>
+
+    </head>
+
+    <body>
+
+        <h2>Bot Dashboard</h2>
+
+        <p>
+            Logged in as:
+            <strong>{bot_name}</strong>
+        </p>
+
+        <p>
+            Discord status:
+            <span class="status">
+                {"ONLINE" if connected else "OFFLINE"}
+            </span>
+        </p>
+
+        <p>
+            Servers:
+            <strong>{len(bot.guilds)}</strong>
+        </p>
+
+        <p>
+            <a href="/health">Health</a>
+            |
+            <a href="/logout">Logout</a>
+        </p>
+
+        <table>
+
+            <tr>
+                <th>Server</th>
+                <th>ID</th>
+                <th>Members</th>
+                <th>Action</th>
+            </tr>
+
+            {rows}
+
+        </table>
+
+    </body>
+
+    </html>
     """
+
+
+# ============================================================
+# SERVER INFORMATION
+# ============================================================
 
 @app.route("/server/<int:guild_id>")
 def server(guild_id):
+
     if not logged_in():
         return redirect(url_for("login"))
 
     guild = bot.get_guild(guild_id)
-    if not guild:
+
+    if guild is None:
         return "Guild not found", 404
 
     return f"""
-    <html><body style="background:#111;color:#eee;font-family:monospace">
-    <h2>{guild.name}</h2>
-    <p>ID: {guild.id} | Members: {guild.member_count} | Channels: {len(guild.channels)} | Roles: {len(guild.roles)}</p>
-    <form method="post" action="/nuke/{guild.id}">
-    <button type="submit" style="background:#900;color:#fff;padding:12px 24px;font-size:16px;border:none;cursor:pointer"
-    onclick="return confirm('NUKE {guild.name}?')">NUKE SERVER</button>
-    </form>
-    <p><a href="/">Back</a></p>
-    </body></html>
+    <!DOCTYPE html>
+
+    <html>
+
+    <head>
+
+        <meta
+            name="viewport"
+            content="width=device-width,initial-scale=1"
+        >
+
+        <title>{guild.name}</title>
+
+    </head>
+
+    <body style="
+        background:#111;
+        color:#eee;
+        font-family:monospace;
+        padding:20px;
+    ">
+
+        <h2>{guild.name}</h2>
+
+        <hr>
+
+        <p>
+            <strong>ID:</strong>
+            {guild.id}
+        </p>
+
+        <p>
+            <strong>Members:</strong>
+            {guild.member_count}
+        </p>
+
+        <p>
+            <strong>Channels:</strong>
+            {len(guild.channels)}
+        </p>
+
+        <p>
+            <strong>Roles:</strong>
+            {len(guild.roles)}
+        </p>
+
+        <p>
+            <strong>Owner:</strong>
+            {guild.owner}
+        </p>
+
+        <hr>
+
+        <h3>Bot Status</h3>
+
+        <p>
+            Connected:
+            {"YES" if bot.is_ready() else "NO"}
+        </p>
+
+        <p>
+            <a href="/">← Back</a>
+        </p>
+
+    </body>
+
+    </html>
     """
 
-@app.route("/nuke/<int:guild_id>", methods=["POST"])
-def nuke(guild_id):
-    if not logged_in():
-        return redirect(url_for("login"))
 
-    guild = bot.get_guild(guild_id)
-    if not guild:
-        return "Guild not found", 404
-
-    # Schedule nuke coroutine on bot's event loop
-    fut = asyncio.run_coroutine_threadsafe(nuke_guild(guild), bot.loop)
-    try:
-        fut.result(timeout=5)
-    except Exception:
-        pass
-
-    return f"""
-    <html><body style="background:#111;color:#eee;font-family:monospace">
-    <h2>Nuke launched on {guild.name}</h2>
-    <p><a href="/">Back</a></p>
-    </body></html>
-    """
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.route("/health")
 def health():
-    return "OK", 200
+
+    discord_status = bot.is_ready()
+
+    return {
+        "flask": "ok",
+        "discord": "online" if discord_status else "offline",
+        "bot": str(bot.user) if bot.user else None,
+        "guilds": len(bot.guilds)
+    }, 200
+
+
+# ============================================================
+# BOT THREAD
+# ============================================================
+
+def run_bot():
+
+    try:
+
+        log.info("Starting Discord bot...")
+
+        bot.run(TOKEN)
+
+    except discord.LoginFailure:
+
+        log.error(
+            "Discord login failed. "
+            "Check the TOKEN environment variable."
+        )
+
+    except Exception:
+
+        log.exception(
+            "Discord bot crashed."
+        )
+
+
+# ============================================================
+# FLASK THREAD / RENDER
+# ============================================================
+
+def run_flask():
+
+    port = int(
+        os.environ.get("PORT", "8080")
+    )
+
+    log.info(
+        "Starting Flask on port %s",
+        port
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        threaded=True
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    threading.Thread(target=keep_alive, daemon=True).start()
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+
+    log.info("Starting application...")
+
+    discord_thread = threading.Thread(
+        target=run_bot,
+        name="DiscordBot",
+        daemon=True
+    )
+
+    discord_thread.start()
+
+    run_flask()
